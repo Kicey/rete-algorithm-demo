@@ -1,0 +1,1 @@
+This project demonstrates the classic rete algorithm accord with [Introduction To The Rete Algorithm](https://community.sap.com/t5/technology-blog-posts-by-sap/introduction-to-the-rete-algorithm/ba-p/13534504) by the example from [How the Rete Algorithm Works](https://www.sparklinglogic.com/rete-algorithm-demystified-part-2/).
