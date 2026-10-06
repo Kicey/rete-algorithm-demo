@@ -2,169 +2,172 @@ package main
 
 import (
 	"fmt"
-	"reflect"
+	"sort"
+	"strconv"
 )
 
-// Fact represents a single piece of data in our system.
-// Any struct can be a fact.
-type Fact interface{}
-
-// Condition represents a simple evaluation on a single fact (used in Alpha Nodes).
-type Condition func(fact Fact) bool
-
-// Action represents the outcome when a rule is fully matched.
-type Action func(facts []Fact)
-
-// -----------------------
-// Node Definitions
-// -----------------------
-
-// ReteNode is the root of the network. All facts enter here.
-type ReteNode struct {
-	Children []*ObjectTypeNode
+// Fact is an immutable value snapshot identified by an insertion handle.
+type Fact struct {
+	Handle int
+	Value  any
 }
 
-func (r *ReteNode) Assert(fact Fact) {
-	fmt.Printf("[ReteNode] Asserting new fact: %+v\n", fact)
-	for _, child := range r.Children {
-		child.Assert(fact)
-	}
+// Tuple retains ordered fact identities for a rule prefix.
+type Tuple struct {
+	Key   string
+	Facts []Fact
 }
 
-// ObjectTypeNode filters facts by their specific Go type.
-type ObjectTypeNode struct {
-	ObjectType reflect.Type
-	Children   []*AlphaNode
+func singleton(f Fact) Tuple {
+	return Tuple{strconv.Itoa(f.Handle), []Fact{f}}
 }
 
-func (ot *ObjectTypeNode) Assert(fact Fact) {
-	if reflect.TypeOf(fact) == ot.ObjectType {
-		fmt.Printf("[ObjectTypeNode] Matched type: %s\n", ot.ObjectType.Name())
-		for _, child := range ot.Children {
-			child.Assert(fact)
+// Copy the prefix so sibling results never share a writable backing array.
+func extend(t Tuple, f Fact) Tuple {
+	facts := append([]Fact(nil), t.Facts...)
+	return Tuple{t.Key + "/" + strconv.Itoa(f.Handle), append(facts, f)}
+}
+
+// Alpha combines a single-fact filter with its retained passing facts.
+type Alpha struct {
+	Test   func(any) bool
+	Memory map[int]Fact
+	Out    []func(Fact, bool)
+}
+
+func (a *Alpha) Push(f Fact, add bool) {
+	if add {
+		if !a.Test(f.Value) {
+			return
 		}
-	}
-}
-
-// AlphaNode checks a specific condition on a fact (Intra-element condition).
-type AlphaNode struct {
-	Description string // For logging
-	Condition   Condition
-	Memory      *AlphaMemory
-}
-
-func (an *AlphaNode) Assert(fact Fact) {
-	if an.Condition(fact) {
-		fmt.Printf("[AlphaNode] Condition '%s' passed for fact: %+v\n", an.Description, fact)
-		an.Memory.Add(fact)
+		if _, exists := a.Memory[f.Handle]; exists {
+			return
+		}
+		a.Memory[f.Handle] = f
 	} else {
-		fmt.Printf("[AlphaNode] Condition '%s' failed for fact: %+v\n", an.Description, fact)
+		stored, exists := a.Memory[f.Handle]
+		if !exists {
+			return
+		}
+		f = stored
+		delete(a.Memory, f.Handle)
+	}
+	for _, out := range a.Out {
+		out(f, add)
 	}
 }
 
-// AlphaMemory stores facts that have passed all previous alpha tests.
-type AlphaMemory struct {
-	Facts    []Fact
-	Children []ReteNodeVisitor
+// Beta retains tuples and propagates insertions and removals to consumers.
+type Beta struct {
+	Memory map[string]Tuple
+	Out    []func(Tuple, bool)
 }
 
-func (am *AlphaMemory) Add(fact Fact) {
-	am.Facts = append(am.Facts, fact)
-	fmt.Printf("[AlphaMemory] Stored fact: %+v. Total facts here: %d\n", fact, len(am.Facts))
-	for _, child := range am.Children {
-		child.RightActivate(fact)
+func (b *Beta) Push(t Tuple, add bool) {
+	if add {
+		if _, exists := b.Memory[t.Key]; exists {
+			return
+		}
+		b.Memory[t.Key] = t
+	} else {
+		stored, exists := b.Memory[t.Key]
+		if !exists {
+			return
+		}
+		t = stored
+		delete(b.Memory, t.Key)
+	}
+	for _, out := range b.Out {
+		out(t, add)
 	}
 }
 
-// AlphaToBetaLeftBridge allows an AlphaMemory to act as the Left input for a BetaNode
-type AlphaToBetaLeftBridge struct {
-	Target *BetaNode
+// Join extends a left tuple with a right fact satisfying a pure predicate.
+type Join struct {
+	Left  *Beta
+	Right *Alpha
+	Test  func(Tuple, Fact) bool
+	Next  *Beta
 }
 
-func (ab *AlphaToBetaLeftBridge) RightActivate(fact Fact) {
-	// Send the single fact as an array representing left memory facts
-	ab.Target.LeftActivate([]Fact{fact})
-}
-
-// BetaNode joins facts from different branches.
-// It has a Left input (from a BetaMemory or AlphaMemory) and a Right input (from an AlphaMemory).
-type BetaNode struct {
-	Description   string
-	JoinCondition func(left []Fact, right Fact) bool
-	Memory        *BetaMemory
-}
-
-func (bn *BetaNode) LeftActivate(leftFacts []Fact) {
-	fmt.Printf("[BetaNode-LeftActivate] '%s' checking left facts: %+v\n", bn.Description, leftFacts)
-	// Add to memory first
-	bn.Memory.LeftFacts = append(bn.Memory.LeftFacts, leftFacts)
-
-	// Iterate through right facts to find matches
-	for _, rightFact := range bn.Memory.RightFacts {
-		if bn.JoinCondition(leftFacts, rightFact) {
-			bn.Memory.Add(append(leftFacts, rightFact))
+func (j *Join) LeftEvent(t Tuple, add bool) {
+	for _, f := range j.Right.Memory {
+		if j.Test(t, f) {
+			j.Next.Push(extend(t, f), add)
 		}
 	}
 }
 
-func (bn *BetaNode) RightActivate(rightFact Fact) {
-	fmt.Printf("[BetaNode-RightActivate] '%s' checking right fact: %+v\n", bn.Description, rightFact)
-	// Add to memory first
-	bn.Memory.RightFacts = append(bn.Memory.RightFacts, rightFact)
-
-	// Iterate through left facts to find matches
-	for _, leftFacts := range bn.Memory.LeftFacts {
-		if bn.JoinCondition(leftFacts, rightFact) {
-			// Creating a new slice containing all facts joined together
-			joined := append([]Fact{}, leftFacts...)
-			joined = append(joined, rightFact)
-			bn.Memory.Add(joined)
+func (j *Join) RightEvent(f Fact, add bool) {
+	for _, t := range j.Left.Memory {
+		if j.Test(t, f) {
+			j.Next.Push(extend(t, f), add)
 		}
 	}
 }
 
-// BetaMemory stores successfully joined facts (tuples).
-type BetaMemory struct {
-	LeftFacts  [][]Fact // Tuples from the left input
-	RightFacts []Fact   // Single facts from the right input
-	Joined     [][]Fact // The newly joined tuples
-	Children   []ReteNodeTupleVisitor
+// Engine owns working memory and the manually wired demonstration network.
+type Engine struct {
+	next                  int
+	facts                 map[int]Fact
+	gold, eligible, other *Alpha
+	left, bonus           *Beta
+	pending               map[string]func()
 }
 
-func (bm *BetaMemory) Add(joinedFacts []Fact) {
-	bm.Joined = append(bm.Joined, joinedFacts)
-	fmt.Printf("[BetaMemory] Stored joined facts: %+v. Total tuples here: %d\n", joinedFacts, len(bm.Joined))
-	for _, child := range bm.Children {
-		child.LeftActivate(joinedFacts)
+// Insert allocates a fresh handle, even when business values are identical.
+func (e *Engine) Insert(v any) int {
+	switch v.(type) {
+	case Account, Flight:
+	default:
+		panic("unsupported fact type")
+	}
+	e.next++
+	f := Fact{e.next, v}
+	e.facts[f.Handle] = f
+	switch v.(type) {
+	case Account:
+		e.gold.Push(f, true)
+	case Flight:
+		e.eligible.Push(f, true)
+	}
+	return f.Handle
+}
+
+// Retract invalidates dependent tuples and cancels their pending actions.
+func (e *Engine) Retract(handle int) {
+	f, exists := e.facts[handle]
+	if !exists {
+		return
+	}
+	delete(e.facts, handle)
+	switch f.Value.(type) {
+	case Account:
+		e.gold.Push(f, false)
+	case Flight:
+		e.eligible.Push(f, false)
 	}
 }
 
-func (bm *BetaMemory) LeftActivate(leftFacts []Fact) {
-	bm.LeftFacts = append(bm.LeftFacts, leftFacts)
-	// Usually passed to BetaNode instead
+// Fire executes pending actions in key order for reproducible demo output.
+func (e *Engine) Fire() {
+	for len(e.pending) > 0 {
+		keys := make([]string, 0, len(e.pending))
+		for key := range e.pending {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if action, exists := e.pending[key]; exists {
+				delete(e.pending, key)
+				action()
+			}
+		}
+	}
 }
 
-// Interfaces for nodes to accept right or left facts
-type ReteNodeVisitor interface {
-	RightActivate(fact Fact)
-}
-
-type ReteNodeTupleVisitor interface {
-	LeftActivate(facts []Fact)
-}
-
-// TerminalNode (Action Node) executes the rule's consequent.
-type TerminalNode struct {
-	RuleName string
-	Action   Action
-}
-
-func (tn *TerminalNode) RightActivate(fact Fact) {
-	fmt.Printf("[TerminalNode] Rule '%s' activated! Executing action...\n", tn.RuleName)
-	tn.Action([]Fact{fact})
-}
-
-func (tn *TerminalNode) LeftActivate(facts []Fact) {
-	fmt.Printf("[TerminalNode] Rule '%s' activated! Executing action...\n", tn.RuleName)
-	tn.Action(facts)
+func (e *Engine) Report(label string) {
+	fmt.Printf("%s: eligible=%d nonPartner=%d gold=%d bonus=%d pending=%d\n",
+		label, len(e.eligible.Memory), len(e.other.Memory),
+		len(e.left.Memory), len(e.bonus.Memory), len(e.pending))
 }

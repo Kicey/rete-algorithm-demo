@@ -1,152 +1,76 @@
 package main
 
-import (
-	"fmt"
-	"reflect"
-)
+import "fmt"
 
-// Fact Definitions (Airline Domain)
-type Account struct {
-	ID          string
-	RewardMiles int
-	Status      string
+type Account struct{ ID, Status string }
+type Flight struct {
+	ID, AccountID string
+	Miles         int
+	Airline       string
 }
 
-type Flight struct {
-	Miles    int
-	Category string
-	Airline  string
+func NewEngine() *Engine {
+	alpha := func(test func(any) bool) *Alpha {
+		return &Alpha{Test: test, Memory: make(map[int]Fact)}
+	}
+	e := &Engine{
+		facts:    make(map[int]Fact),
+		pending:  make(map[string]func()),
+		left:     &Beta{Memory: make(map[string]Tuple)},
+		bonus:    &Beta{Memory: make(map[string]Tuple)},
+		gold:     alpha(func(v any) bool { return v.(Account).Status == "Gold" }),
+		eligible: alpha(func(v any) bool { return v.(Flight).Miles >= 500 }),
+		other:    alpha(func(v any) bool { return v.(Flight).Airline != "Partner" }),
+	}
+	terminal := func(rule string, action func(Tuple)) func(Tuple, bool) {
+		return func(t Tuple, add bool) {
+			key := rule + "/" + t.Key
+			if add {
+				e.pending[key] = func() { action(t) }
+			} else {
+				delete(e.pending, key)
+			}
+		}
+	}
+	base := terminal("base", func(t Tuple) {
+		f := t.Facts[0].Value.(Flight)
+		fmt.Printf("base %s: %d miles\n", f.ID, f.Miles)
+	})
+	e.bonus.Out = append(e.bonus.Out, terminal("bonus", func(t Tuple) {
+		a := t.Facts[0].Value.(Account)
+		f := t.Facts[1].Value.(Flight)
+		fmt.Printf("bonus %s/%s: %d miles\n", a.ID, f.ID, f.Miles)
+	}))
+	j := &Join{
+		Left: e.left, Right: e.other, Next: e.bonus,
+		Test: func(t Tuple, f Fact) bool {
+			return t.Facts[0].Value.(Account).ID == f.Value.(Flight).AccountID
+		},
+	}
+	e.gold.Out = append(e.gold.Out, func(f Fact, add bool) {
+		e.left.Push(singleton(f), add)
+	})
+	e.left.Out = append(e.left.Out, j.LeftEvent)
+	e.eligible.Out = append(e.eligible.Out,
+		func(f Fact, add bool) { base(singleton(f), add) }, e.other.Push)
+	e.other.Out = append(e.other.Out, j.RightEvent)
+	return e
 }
 
 func main() {
-	fmt.Println("--- Building Rete Network ---")
-
-	// Create an empty network
-	reteRoot := &ReteNode{}
-
-	// Object type nodes
-	accountNode := &ObjectTypeNode{ObjectType: reflect.TypeOf(Account{})}
-	flightNode := &ObjectTypeNode{ObjectType: reflect.TypeOf(Flight{})}
-
-	// Append object nodes to the root Rete node
-	reteRoot.Children = append(reteRoot.Children, accountNode)
-	reteRoot.Children = append(reteRoot.Children, flightNode)
-
-	// Build Rule 1: IF reward miles > 100k, THEN status = Gold
-	// This only requires Account class checking.
-	alphaMem1 := &AlphaMemory{}
-	rule1Alpha := &AlphaNode{
-		Description: "Account.RewardMiles > 100000",
-		Condition: func(f Fact) bool {
-			if a, ok := f.(Account); ok {
-				return a.RewardMiles > 100000
-			}
-			return false
-		},
-		Memory: alphaMem1,
-	}
-
-	rule1Terminal := &TerminalNode{
-		RuleName: "Assign Gold Status",
-		Action: func(facts []Fact) {
-			if acc, ok := facts[0].(Account); ok {
-				fmt.Printf(">> ACTION EXECUTED: Account %s upgraded to Gold status!\n", acc.ID)
-			}
-		},
-	}
-
-	// Link them up
-	alphaMem1.Children = append(alphaMem1.Children, rule1Terminal)
-	accountNode.Children = append(accountNode.Children, rule1Alpha)
-
-	// Build Rule 2: IF flight miles >= 500, THEN reward flight miles
-	alphaMem2 := &AlphaMemory{}
-	rule2Alpha := &AlphaNode{
-		Description: "Flight.Miles >= 500",
-		Condition: func(f Fact) bool {
-			if fl, ok := f.(Flight); ok {
-				return fl.Miles >= 500
-			}
-			return false
-		},
-		Memory: alphaMem2,
-	}
-
-	rule2Terminal := &TerminalNode{
-		RuleName: "Reward Flight Miles",
-		Action: func(facts []Fact) {
-			if fl, ok := facts[0].(Flight); ok {
-				fmt.Printf(">> ACTION EXECUTED: Flight over 500 miles. Ready to award %d miles.\n", fl.Miles)
-			}
-		},
-	}
-
-	alphaMem2.Children = append(alphaMem2.Children, rule2Terminal)
-	flightNode.Children = append(flightNode.Children, rule2Alpha)
-
-	// Build Rule 7: IF status is Gold AND flight airline is not partner, THEN reward 100% bonus miles
-	// This involves a JOIN (Beta Node)
-	// We reuse alphaMem1 (Account>100k) as the Left Input (Account part)
-	// We need a new AlphaNode for the Right Input (Flight part: Not Partner)
-
-	alphaMem3 := &AlphaMemory{}
-	rule7AlphaRight := &AlphaNode{
-		Description: "Flight.Airline != Partner",
-		Condition: func(f Fact) bool {
-			if fl, ok := f.(Flight); ok {
-				return fl.Airline != "Partner"
-			}
-			return false
-		},
-		Memory: alphaMem3,
-	}
-	flightNode.Children = append(flightNode.Children, rule7AlphaRight)
-
-	betaMem7 := &BetaMemory{}
-	betaNode7 := &BetaNode{
-		Description: "Join Account(Gold) & Flight(!Partner)",
-		JoinCondition: func(left []Fact, right Fact) bool {
-			// This simplified condition always joins an account to a flight since the alpha filters did the work.
-			// Usually here you'd match an ID like Account.ID == Flight.AccountID
-			return true
-		},
-		Memory: betaMem7,
-	}
-
-	rule7Terminal := &TerminalNode{
-		RuleName: "+100% Bonus Miles for Gold Status",
-		Action: func(facts []Fact) {
-			acc := facts[0].(Account)
-			fl := facts[1].(Flight)
-			fmt.Printf(">> ACTION EXECUTED: Gold member %s earns 100%% bonus miles. Bonus: %d\n", acc.ID, fl.Miles)
-		},
-	}
-
-	// Link up the Beta Join
-	// We want AlphaMem1 to be the Left Input and AlphaMem3 to be the Right input
-	// Helper for Left Input bridging (Alpha to Beta)
-	leftBridge := &AlphaToBetaLeftBridge{Target: betaNode7}
-	alphaMem1.Children = append(alphaMem1.Children, leftBridge)
-
-	// Right input directly from AlphaMem3
-	alphaMem3.Children = append(alphaMem3.Children, betaNode7)
-	betaMem7.Children = append(betaMem7.Children, rule7Terminal)
-
-	fmt.Println("--- Network Builder Complete --- \n")
-
-	// Rete Runtime evaluation
-	fmt.Println("--- Rete Runtime Cycle: Asserting Facts ---")
-
-	// Create facts based on the article example
-	joeAccount := Account{ID: "Joe123", RewardMiles: 150000, Status: "Unknown"}
-	sfFlight := Flight{Miles: 2419, Category: "Economy", Airline: "Original"}
-
-	// Assert facts into Rete Network Root
-	fmt.Printf("\n[Input Fact] Entering Account... \n")
-	reteRoot.Assert(joeAccount)
-
-	fmt.Printf("\n[Input Fact] Entering Flight... \n")
-	reteRoot.Assert(sfFlight)
-
-	fmt.Println("\n--- Operations Finished ---")
+	e := NewEngine()
+	e.Insert(Account{"A1", "Gold"})
+	silver := e.Insert(Account{"A2", "Silver"})
+	f1 := e.Insert(Flight{"F1", "A1", 2419, "Original"})
+	e.Insert(Flight{"F2", "A2", 800, "Original"})
+	e.Insert(Flight{"F3", "A1", 300, "Original"})
+	e.Insert(Flight{"F4", "A1", 900, "Partner"})
+	e.Report("before retraction")
+	e.Retract(f1)
+	e.Report("after retraction")
+	e.Fire()
+	e.Retract(silver)
+	e.Insert(Account{"A2", "Gold"})
+	e.Report("after account replacement")
+	e.Fire()
 }
